@@ -11,10 +11,13 @@ import io
 import os
 import re
 import sys
+import typing # Add import for Union
 from pathlib import Path
 
 from pypdf import PdfWriter, PdfReader
-from reportlab.lib.pagesizes import LETTER
+from pypdf.generic import RectangleObject
+from pypdf import Transformation
+from reportlab.lib.pagesizes import A4, LETTER
 from reportlab.pdfgen import canvas
 
 try:
@@ -26,6 +29,9 @@ try:
 except ImportError:
     print("PyQt6 not found. Please install it: pip install PyQt6")
     sys.exit(1)
+
+# Define A4 dimensions for convenience
+A4_WIDTH, A4_HEIGHT = A4
 
 # ----------------- helpers -------------------------------------------------- #
 
@@ -41,7 +47,7 @@ def iter_pdfs(folder: Path):
     for p in pdf_files:
         yield p
 
-def make_title_page(text: str) -> PdfReader | None:
+def make_title_page(text: str) -> typing.Union[PdfReader, None]:
     """
     Build a 1‑page PDF in memory with the given `text` centered,
     return it as a PdfReader object ready for merging.
@@ -51,8 +57,8 @@ def make_title_page(text: str) -> PdfReader | None:
         return None
     buf = io.BytesIO()
     try:
-        c = canvas.Canvas(buf, pagesize=LETTER)
-        width, height = LETTER
+        c = canvas.Canvas(buf, pagesize=A4)
+        width, height = A4
         # Use a larger font size for a heading style
         font_size = 32 # Increased back to 32 for emphasis
         c.setFont("Helvetica-Bold", font_size)
@@ -102,11 +108,12 @@ def make_title_page(text: str) -> PdfReader | None:
 
 
 def merge(dir_path: Path, out_file: Path, status_callback=None):
-    """Merges PDFs with title pages, using callback for status updates."""
+    """Merges PDFs, resizing all pages to A4 and adding A4 title pages."""
     writer = PdfWriter()
-    pdf_paths = list(iter_pdfs(dir_path)) # Get list upfront for count
+    pdf_paths = list(iter_pdfs(dir_path))
     count = len(pdf_paths)
     merged_count = 0
+    processed_page_count = 0 # Track total pages processed
 
     if not count:
         if status_callback:
@@ -117,42 +124,95 @@ def merge(dir_path: Path, out_file: Path, status_callback=None):
         status_callback(f"Starting merge of {count} PDF(s)...")
 
     for i, pdf_path in enumerate(pdf_paths):
-        title_text = pdf_path.stem # filename without .pdf
+        title_text = pdf_path.stem
         if status_callback:
             status_callback(f"Processing ({i+1}/{count}): {pdf_path.name}")
 
+        # 1. Add A4 Title Page (already generates A4)
         title_pdf = make_title_page(title_text)
         if title_pdf:
             try:
                 writer.append(fileobj=title_pdf)
+                processed_page_count += 1
             except Exception as e:
                  print(f"Error appending title page for {title_text}: {e}")
                  if status_callback:
                      status_callback(f"❌ Error adding title for {pdf_path.name}")
-                 continue # Skip this file? Or just the title? Let's skip title.
-                 # Alternative: Raise error? Depends on desired behavior.
+                 # Decide whether to continue with the file or skip
+                 continue # Skip this file if title fails
 
+        # 2. Process and resize original PDF pages to A4
+        file_processed = False
         try:
-            writer.append(str(pdf_path))
-            merged_count += 1
+            reader = PdfReader(str(pdf_path))
+            for page_num, page in enumerate(reader.pages):
+                original_width = float(page.mediabox.width)
+                original_height = float(page.mediabox.height)
+
+                # Create a new blank A4 page in the writer for each original page
+                new_page = writer.add_blank_page(width=A4_WIDTH, height=A4_HEIGHT)
+                processed_page_count += 1
+
+                # Skip transformation if page is already A4 (optional optimization)
+                # tolerance = 0.1
+                # if abs(original_width - A4_WIDTH) < tolerance and abs(original_height - A4_HEIGHT) < tolerance:
+                #     new_page.merge_page(page)
+                #     continue
+
+                # Calculate scale factor to fit content within A4, preserving aspect ratio
+                scale_w = A4_WIDTH / original_width if original_width else 1
+                scale_h = A4_HEIGHT / original_height if original_height else 1
+                scale = min(scale_w, scale_h)
+
+                # Calculate translation to center the scaled content
+                new_content_width = original_width * scale
+                new_content_height = original_height * scale
+                tx = (A4_WIDTH - new_content_width) / 2
+                ty = (A4_HEIGHT - new_content_height) / 2
+
+                # Create transformation
+                transformation = Transformation().scale(sx=scale, sy=scale).translate(tx=tx, ty=ty)
+
+                # Merge the original page content onto the blank A4 page with transformation
+                new_page.merge_transformed_page(page, transformation, expand=False)
+
+            file_processed = True # Mark file as processed
+
         except Exception as e:
-            print(f"Error appending PDF {pdf_path.name}: {e}")
-            # Potentially corrupted PDF, could be PyPDF issue too
-            if hasattr(e, 'strict') and e.strict: # Check if it's a PdfReadError related to strictness
-                 print(f"Trying to append {pdf_path.name} in non-strict mode.")
+            print(f"Error processing PDF {pdf_path.name}: {e}")
+            # Attempt non-strict reading if applicable
+            if hasattr(e, 'strict') and e.strict:
+                 print(f"Trying to process {pdf_path.name} in non-strict mode.")
                  try:
-                     # Need to open reader explicitly for non-strict append
-                     reader = PdfReader(str(pdf_path), strict=False)
-                     writer.append(fileobj=reader)
-                     merged_count += 1
+                     reader_nonstrict = PdfReader(str(pdf_path), strict=False)
+                     for page_num, page in enumerate(reader_nonstrict.pages):
+                        # --- Repeat the transformation logic --- #
+                        original_width = float(page.mediabox.width)
+                        original_height = float(page.mediabox.height)
+                        new_page = writer.add_blank_page(width=A4_WIDTH, height=A4_HEIGHT)
+                        processed_page_count += 1
+                        scale_w = A4_WIDTH / original_width if original_width else 1
+                        scale_h = A4_HEIGHT / original_height if original_height else 1
+                        scale = min(scale_w, scale_h)
+                        new_content_width = original_width * scale
+                        new_content_height = original_height * scale
+                        tx = (A4_WIDTH - new_content_width) / 2
+                        ty = (A4_HEIGHT - new_content_height) / 2
+                        transformation = Transformation().scale(sx=scale, sy=scale).translate(tx=tx, ty=ty)
+                        new_page.merge_transformed_page(page, transformation, expand=False)
+                        # --- End repeated logic --- #
+                     file_processed = True # Mark file as processed even in non-strict
                  except Exception as e_nonstrict:
-                      print(f"Error appending {pdf_path.name} even in non-strict mode: {e_nonstrict}")
+                      print(f"Error processing {pdf_path.name} even in non-strict mode: {e_nonstrict}")
                       if status_callback:
-                        status_callback(f"❌ Error adding {pdf_path.name}")
+                          status_callback(f"❌ Error processing {pdf_path.name}")
             else:
                  if status_callback:
-                     status_callback(f"❌ Error adding {pdf_path.name}")
+                     status_callback(f"❌ Error processing {pdf_path.name}")
 
+        # Only increment merged_count if the file (or part of it) was successfully processed
+        if file_processed:
+            merged_count += 1
 
     if merged_count > 0:
         try:
@@ -160,7 +220,7 @@ def merge(dir_path: Path, out_file: Path, status_callback=None):
             with open(str(out_file), "wb") as fp:
                 writer.write(fp)
             if status_callback:
-                status_callback(f"✅ Merged {merged_count} PDF(s) into {out_file.name}")
+                status_callback(f"✅ Merged {merged_count} PDF file(s) ({processed_page_count} total pages) into {out_file.name}")
         except Exception as e:
             print(f"Error writing final PDF {out_file}: {e}")
             if status_callback:
