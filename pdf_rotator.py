@@ -35,16 +35,24 @@ class PDFProcessor(QThread):
     progress_updated = pyqtSignal(str)
     processing_complete = pyqtSignal(int)  # Returns number of pages processed
     
-    def __init__(self, input_file, output_file, gap_points: int, layout: str):
+    def __init__(self, input_file, output_file, gap_points: int, layout: str, size_factor: float):
         super().__init__()
         self.input_file = input_file
         self.output_file = output_file
         self.gap_points = gap_points
         self.layout = layout
+        self.size_factor = size_factor
     
     def run(self):
         try:
-            result = process_pdf(self.input_file, self.output_file, self.gap_points, self.progress_updated.emit, self.layout)
+            result = process_pdf(
+                self.input_file,
+                self.output_file,
+                self.gap_points,
+                self.progress_updated.emit,
+                self.layout,
+                self.size_factor,
+            )
             self.processing_complete.emit(result)
         except Exception as e:
             self.progress_updated.emit(f"❌ Error: {str(e)}")
@@ -66,7 +74,7 @@ def create_blank_a4_page():
     """Create a blank A4 page."""
     return PdfWriter().add_blank_page(width=A4_WIDTH, height=A4_HEIGHT)
 
-def arrange_pages_on_a4_rotated(page1, page2=None, gap=20, orientation: str = "side-by-side"):
+def arrange_pages_on_a4_rotated(page1, page2=None, gap=20, orientation: str = "side-by-side", size_factor: float = 1.0):
     """Place one or two original pages rotated 90° left onto a single A4 page.
 
     If page2 is None, only page1 is placed centered in the left slot.
@@ -77,9 +85,10 @@ def arrange_pages_on_a4_rotated(page1, page2=None, gap=20, orientation: str = "s
     def place_rotated(src_page, slot_index: int):
         # side-by-side: slot_index 0 => left, 1 => right
         # top-bottom: slot_index 0 => top, 1 => bottom
-        if orientation == "top-bottom":
+        if orientation in ("top-bottom", "top-bottom-3"):
             available_height = A4_HEIGHT - gap
-            slot_height = available_height / 2
+            rows = 3 if orientation == "top-bottom-3" else 2
+            slot_height = available_height / rows
             slot_width = A4_WIDTH
         else:
             available_width = A4_WIDTH - gap
@@ -92,11 +101,16 @@ def arrange_pages_on_a4_rotated(page1, page2=None, gap=20, orientation: str = "s
         # After 90° CCW rotation, dimensions swap
         rot_w, rot_h = h, w
 
-        scale = min(slot_width / rot_w if rot_w else 1, slot_height / rot_h if rot_h else 1)
+        max_scale = min(slot_width / rot_w if rot_w else 1, slot_height / rot_h if rot_h else 1)
+        scale = max(0.1, min(1.0, size_factor)) * max_scale
 
         # Center within slot
-        if orientation == "top-bottom":
-            base_y = slot_height + gap if slot_index == 0 else 0
+        if orientation in ("top-bottom", "top-bottom-3"):
+            if orientation == "top-bottom-3":
+                # slot_index: 0 => top, 1 => middle, 2 => bottom
+                base_y = slot_height * (2 - slot_index) + (gap if slot_index < 2 else 0) + (gap if slot_index == 0 else 0)
+            else:
+                base_y = slot_height + gap if slot_index == 0 else 0
             content_w = rot_w * scale
             content_h = rot_h * scale
             tx = (A4_WIDTH - content_w) / 2
@@ -128,7 +142,47 @@ def arrange_pages_on_a4_rotated(page1, page2=None, gap=20, orientation: str = "s
 
     return a4_page
 
-def process_pdf(input_file: Path, output_file: Path, gap_points: int = 20, status_callback=None, layout: str = "side-by-side"):
+def arrange_pages_on_a4_rotated_three(pages, gap=20, size_factor: float = 1.0):
+    """Place up to three original pages rotated 90° left onto a single A4 page (stacked top-bottom)."""
+    writer = PdfWriter()
+    a4_page = writer.add_blank_page(width=A4_WIDTH, height=A4_HEIGHT)
+
+    rows, cols = 3, 1
+    available_width = A4_WIDTH
+    available_height = A4_HEIGHT - (rows - 1) * gap
+    slot_width = available_width / cols
+    slot_height = available_height / rows
+
+    def place_at(src_page, row_index: int):
+        base_x = 0
+        # row 0 is top, convert to PDF coords (origin bottom-left)
+        base_y = A4_HEIGHT - ((row_index + 1) * slot_height) - (row_index * gap)
+
+        w = float(src_page.mediabox.width)
+        h = float(src_page.mediabox.height)
+        rot_w, rot_h = h, w
+        max_scale = min(slot_width / rot_w if rot_w else 1, slot_height / rot_h if rot_h else 1)
+        scale = max(0.1, min(1.0, size_factor)) * max_scale
+        content_w = rot_w * scale
+        content_h = rot_h * scale
+        tx = base_x + (slot_width - content_w) / 2
+        ty = base_y + (slot_height - content_h) / 2
+
+        transform = (
+            Transformation()
+            .rotate(90)
+            .translate(h, 0)
+            .scale(scale)
+            .translate(tx, ty)
+        )
+        a4_page.merge_transformed_page(src_page, transform, expand=False)
+
+    for idx, p in enumerate(pages[:3]):
+        place_at(p, idx)
+
+    return a4_page
+
+def process_pdf(input_file: Path, output_file: Path, gap_points: int = 20, status_callback=None, layout: str = "side-by-side", size_factor: float = 1.0):
     """
     Process PDF: rotate pages 90° left and arrange 2 per A4 sheet.
     
@@ -159,24 +213,34 @@ def process_pdf(input_file: Path, output_file: Path, gap_points: int = 20, statu
         # Create output writer
         writer = PdfWriter()
         
-        # Process pages in pairs
-        for i in range(0, total_pages, 2):
+        # Process pages according to layout (2-up or 3-up)
+        step = 3 if layout == "top-bottom-3" else 2
+        for i in range(0, total_pages, step):
             if status_callback:
                 status_callback(f"🔄 Processing pages {i+1}-{min(i+2, total_pages)}...")
             
             # Get the first page
             page1 = reader.pages[i]
             
-            if i + 1 < total_pages:
-                # Get the second page
-                page2 = reader.pages[i + 1]
-                # Create A4 page with both rotated pages directly from originals
-                a4_page = arrange_pages_on_a4_rotated(page1, page2, gap_points, layout)
+            if layout == "top-bottom-3":
+                pages = [page1]
+                if i + 1 < total_pages:
+                    pages.append(reader.pages[i + 1])
+                if i + 2 < total_pages:
+                    pages.append(reader.pages[i + 2])
+                a4_page = arrange_pages_on_a4_rotated_three(pages, gap_points, size_factor)
                 writer.add_page(a4_page)
             else:
-                # Only one page left, create A4 with just that page
-                a4_page = arrange_pages_on_a4_rotated(page1, None, gap_points, layout)
-                writer.add_page(a4_page)
+                if i + 1 < total_pages:
+                    # Get the second page
+                    page2 = reader.pages[i + 1]
+                    # Create A4 page with both rotated pages directly from originals
+                    a4_page = arrange_pages_on_a4_rotated(page1, page2, gap_points, layout, size_factor)
+                    writer.add_page(a4_page)
+                else:
+                    # Only one page left, create A4 with just that page
+                    a4_page = arrange_pages_on_a4_rotated(page1, None, gap_points, layout, size_factor)
+                    writer.add_page(a4_page)
         
         # Save the output PDF
         if status_callback:
@@ -250,8 +314,15 @@ class PDFRotatorApp(QWidget):
         layout.addWidget(self.layout_label)
         from PyQt6.QtWidgets import QComboBox
         self.layout_combo = QComboBox()
-        self.layout_combo.addItems(["side-by-side", "top-bottom"])  # default side-by-side
+        self.layout_combo.addItems(["side-by-side", "top-bottom", "top-bottom-3"])  # default side-by-side
         layout.addWidget(self.layout_combo)
+
+        # Size factor input
+        self.size_label = QLabel('Size factor (0.1 - 1.0):')
+        layout.addWidget(self.size_label)
+        self.size_input = QLineEdit('1.0')
+        self.size_input.setPlaceholderText('Enter a value between 0.1 and 1.0 (default: 1.0)')
+        layout.addWidget(self.size_input)
         
         # Process button
         self.process_button = QPushButton('Process PDF')
@@ -354,9 +425,21 @@ class PDFRotatorApp(QWidget):
             gap_points = 20
             self.update_status("Invalid gap value. Using default 20 points.")
 
+        # Parse size factor
+        try:
+            size_factor = float(self.size_input.text().strip()) if self.size_input.text().strip() else 1.0
+        except ValueError:
+            size_factor = 1.0
+            self.update_status("Invalid size factor. Using default 1.0.")
+        # Clamp the value between 0.1 and 1.0
+        if size_factor < 0.1:
+            size_factor = 0.1
+        if size_factor > 1.0:
+            size_factor = 1.0
+
         # Start processing in a separate thread
         chosen_layout = self.layout_combo.currentText()
-        self.processor = PDFProcessor(self.input_file, self.output_file, gap_points, chosen_layout)
+        self.processor = PDFProcessor(self.input_file, self.output_file, gap_points, chosen_layout, size_factor)
         self.processor.progress_updated.connect(self.update_status)
         self.processor.processing_complete.connect(self.processing_finished)
         self.processor.start()
